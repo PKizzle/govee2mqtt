@@ -21,7 +21,7 @@ on:
       - ".dockerignore"
 
 env:
-  IMAGE: ghcr.io/wez/govee2mqtt
+  IMAGE: ghcr.io/pkizzle/govee2mqtt
 
 jobs:
   build:
@@ -129,6 +129,7 @@ jobs:
             type=ref,event=branch,enable=${{ github.ref != 'refs/heads/main' }}
             type=ref,event=tag,enable=${{ github.ref_type == 'tag' }}
             type=ref,event=pr
+            type=sha,prefix=sha-,format=short
       - name: Login to GHCR
         if: ${{ github.event_name != 'pull_request' }}
         uses: docker/login-action@v4
