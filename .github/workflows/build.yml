@@ -149,67 +149,87 @@ jobs:
           docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
   addon:
     if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     needs:
       - merge
     permissions:
       contents: read
       id-token: write
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
-      - name: Login to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: https://ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Apply tag to version
         run: ./scripts/apply-tag.sh
+      - name: Read add-on version
+        id: version
+        run: echo "version=$(yq -r .version addon/config.yaml)" >> "$GITHUB_OUTPUT"
       - name: Build and Publish Home Assistant Add On
-        uses: home-assistant/builder@2026.02.1
+        uses: home-assistant/builder/actions/build-image@2026.09.0
         with:
-          args: |
-            --amd64 \
-            --aarch64 \
-            --cosign \
-            --target /data/addon
+          arch: ${{ matrix.arch }}
+          context: ./addon
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image: ${{ env.IMAGE }}-${{ matrix.arch }}
+          image-tags: |
+            ${{ steps.version.outputs.version }}
+            latest
+          version: ${{ steps.version.outputs.version }}
+          build-args: |
+            GOVEE2MQTT_IMAGE=${{ env.IMAGE }}:${{ github.ref_name }}
+          labels: |
+            io.hass.type=addon
+            io.hass.name=Govee to MQTT Bridge
+            io.hass.description=Control Govee Devices
+            io.hass.url=https://github.com/wez/govee2mqtt
+          cosign-base-verify: ghcr.io/home-assistant/base-debian:bookworm
+          cosign-base-identity: https://github.com/home-assistant/docker-base/.*
+          push: "true"
 
   test-addon:
     if: ${{ ! ( github.event_name == 'push' && github.ref_type == 'tag' ) }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    # Builds the add-on from the most recently published image, not the one
+    # built above: that one is not pushed for pull requests. The add-on build
+    # does not run the binary, so this still validates its configuration.
     needs:
-      # Note! Despite the dependency edge here to the build steps above,
-      # this test-addon build flow will build the addon from the latest
-      # images that were published to ghcr.io, which is NOT the ones we
-      # build here because we don't push those when we trigger the conditions
-      # for this to build.
-      # Thats "OK" because the addon build doesn't actually run anything
-      # from that container image.
-      # The test-addon flow is validating that the addon build configuration
-      # looks plausible, so the prior image should be sufficient for that.
-      # If you are reading this and know how to get the bits above funnelled
-      # into the hass build below, and it isn't eye-bleedingly-gnarly, then
-      # please submit a PR!
       - build
     permissions:
       contents: read
-      id-token: write
-      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
-      - name: Login to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: https://ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Read add-on version
+        id: version
+        run: echo "version=$(yq -r .version addon/config.yaml)" >> "$GITHUB_OUTPUT"
       - name: Test Build Home Assistant Add On
-        uses: home-assistant/builder@2026.02.1
+        uses: home-assistant/builder/actions/build-image@2026.09.0
         with:
-          args: |
-            --test \
-            --amd64 \
-            --aarch64 \
-            --cosign \
-            --target /data/addon
+          arch: ${{ matrix.arch }}
+          context: ./addon
+          image: ${{ env.IMAGE }}-${{ matrix.arch }}
+          image-tags: test
+          version: ${{ steps.version.outputs.version }}
+          build-args: |
+            GOVEE2MQTT_IMAGE=${{ env.IMAGE }}:latest
+          labels: |
+            io.hass.type=addon
+            io.hass.name=Govee to MQTT Bridge
+            io.hass.description=Control Govee Devices
+            io.hass.url=https://github.com/wez/govee2mqtt
+          cosign: "false"
+          push: "false"
