@@ -20,6 +20,19 @@ use std::time::Duration;
 
 const HASS_REGISTER_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 
+/// How long we wait for libmosquitto to restore the broker connection
+/// after an unexpected disconnect before we give up on it.
+///
+/// libmosquitto normally reconnects within a second or two, but
+/// `mosquitto_loop_forever` returns, and its loop thread exits, on errors
+/// it considers fatal (for example `MOSQ_ERR_INVAL` when the new socket's
+/// descriptor is at or above `FD_SETSIZE`, or any error while `errno` is
+/// `EPROTO`). No further event is delivered in that case, so without a
+/// deadline we would wait for a `Connected` event forever while the
+/// process looks healthy. Returning an error ends the process so that the
+/// supervisor restarts it with a fresh client.
+const MQTT_RECONNECT_GRACE: tokio::time::Duration = tokio::time::Duration::from_secs(60);
+
 #[derive(clap::Parser, Debug)]
 pub struct HassArguments {
     /// The mqtt broker hostname or address.
@@ -583,8 +596,9 @@ async fn run_mqtt_loop(
 
     let mut router = rebuild_router(&client, &state).await?;
     let mut need_rebuild = false;
+    let mut disconnected_since: Option<tokio::time::Instant> = None;
 
-    while let Ok(event) = subscriber.recv().await {
+    while let Some(event) = next_mqtt_event(&subscriber, disconnected_since).await? {
         match event {
             Event::Message(msg) => {
                 let router = router.clone();
@@ -598,9 +612,15 @@ async fn run_mqtt_loop(
             Event::Disconnected(reason) => {
                 log::warn!("MQTT disconnected with reason={reason}");
                 need_rebuild = true;
+                disconnected_since.get_or_insert_with(tokio::time::Instant::now);
             }
             Event::Connected(status) => {
                 log::info!("MQTT connected with status={status}");
+                // A refused CONNACK is also reported here, followed by
+                // another disconnect; only an accepted one ends the outage.
+                if status.0 == 0 {
+                    disconnected_since = None;
+                }
                 if need_rebuild {
                     router = rebuild_router(&client, &state).await?;
                 }
@@ -611,6 +631,24 @@ async fn run_mqtt_loop(
     log::info!("subscriber.recv loop terminated");
 
     Ok(())
+}
+
+/// Waits for the next client event. While disconnected, fails once
+/// `MQTT_RECONNECT_GRACE` has passed since the disconnect without an event.
+/// Returns `None` when the event stream has ended.
+async fn next_mqtt_event(
+    subscriber: &Receiver<Event>,
+    disconnected_since: Option<tokio::time::Instant>,
+) -> anyhow::Result<Option<Event>> {
+    let event = match disconnected_since {
+        Some(since) => tokio::time::timeout_at(since + MQTT_RECONNECT_GRACE, subscriber.recv())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("MQTT connection was not restored within {MQTT_RECONNECT_GRACE:?}")
+            })?,
+        None => subscriber.recv().await,
+    };
+    Ok(event.ok())
 }
 
 pub async fn spawn_hass_integration(
@@ -739,5 +777,32 @@ mod tests {
     #[test]
     fn test_camel_case_emoji() {
         assert_eq!(camel_case_to_space_separated("🔥lightMode"), "🔥light Mode");
+    }
+
+    #[tokio::test]
+    async fn next_mqtt_event_gives_up_after_reconnect_grace() {
+        let (_tx, rx) = async_channel::unbounded::<Event>();
+        let since = tokio::time::Instant::now() - MQTT_RECONNECT_GRACE;
+        assert!(next_mqtt_event(&rx, Some(since)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn next_mqtt_event_delivers_queued_event_while_disconnected() {
+        let (tx, rx) = async_channel::unbounded();
+        tx.send(Event::Connected(mosquitto_rs::ConnectionStatus(0)))
+            .await
+            .unwrap();
+        let since = tokio::time::Instant::now();
+        assert!(matches!(
+            next_mqtt_event(&rx, Some(since)).await,
+            Ok(Some(Event::Connected(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn next_mqtt_event_ends_with_the_stream() {
+        let (tx, rx) = async_channel::unbounded::<Event>();
+        drop(tx);
+        assert!(matches!(next_mqtt_event(&rx, None).await, Ok(None)));
     }
 }
