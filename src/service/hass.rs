@@ -20,18 +20,12 @@ use std::time::Duration;
 
 const HASS_REGISTER_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(15);
 
-/// How long we wait for libmosquitto to restore the broker connection
-/// after an unexpected disconnect before we give up on it.
-///
-/// libmosquitto normally reconnects within a second or two, but
-/// `mosquitto_loop_forever` returns, and its loop thread exits, on errors
-/// it considers fatal (for example `MOSQ_ERR_INVAL` when the new socket's
-/// descriptor is at or above `FD_SETSIZE`, or any error while `errno` is
-/// `EPROTO`). No further event is delivered in that case, so without a
-/// deadline we would wait for a `Connected` event forever while the
-/// process looks healthy. Returning an error ends the process so that the
-/// supervisor restarts it with a fresh client.
-const MQTT_RECONNECT_GRACE: tokio::time::Duration = tokio::time::Duration::from_secs(60);
+/// How long to wait after an unexpected disconnect for libmosquitto to
+/// reconnect. Its loop thread exits on errors it treats as fatal and then
+/// sends no further event, so we return an error, which ends the process
+/// and lets the supervisor restart us. A broker outage longer than this
+/// restarts us too, so it is long enough to ride out a broker host reboot.
+const MQTT_RECONNECT_GRACE: tokio::time::Duration = tokio::time::Duration::from_secs(300);
 
 /// How frequently we re-assert that we are online by publishing to the
 /// availability topic.
@@ -645,11 +639,7 @@ async fn run_mqtt_loop(
             }
             Event::Connected(status) => {
                 log::info!("MQTT connected with status={status}");
-                // A refused CONNACK is also reported here, followed by
-                // another disconnect; only an accepted one ends the outage.
-                if status.0 == 0 {
-                    disconnected_since = None;
-                }
+                disconnected_since = None;
                 if need_rebuild {
                     router = rebuild_router(&client, &state).await?;
                 }
@@ -662,8 +652,8 @@ async fn run_mqtt_loop(
     Ok(())
 }
 
-/// Waits for the next client event. While disconnected, fails once
-/// `MQTT_RECONNECT_GRACE` has passed since the disconnect without an event.
+/// Waits for the next client event. While disconnected, fails if none
+/// arrives within `MQTT_RECONNECT_GRACE` of the first disconnect.
 /// Returns `None` when the event stream has ended.
 async fn next_mqtt_event(
     subscriber: &Receiver<Event>,
@@ -844,7 +834,10 @@ mod tests {
     async fn next_mqtt_event_gives_up_after_reconnect_grace() {
         let (_tx, rx) = async_channel::unbounded::<Event>();
         let since = tokio::time::Instant::now() - MQTT_RECONNECT_GRACE;
-        assert!(next_mqtt_event(&rx, Some(since)).await.is_err());
+        let res = tokio::time::timeout(Duration::from_secs(5), next_mqtt_event(&rx, Some(since)))
+            .await
+            .expect("the reconnect deadline was ignored");
+        assert!(res.is_err());
     }
 
     #[tokio::test]
